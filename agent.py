@@ -1,6 +1,5 @@
 #!/usr/bin/env/ python3
 # LiveKit Agents v1: AgentSession + Agent + OpenAI Realtime + Spotify + Camera
-from typing import AsyncIterable
 import os, asyncio, base64, subprocess, datetime, sys, fcntl
 from pathlib import Path
 from dotenv import load_dotenv
@@ -308,7 +307,6 @@ class PikaAgent(Agent):
     def __init__(self) -> None:
         # We’ll keep a minimal “awake” flag the model can toggle via a tool.
         self._awake = False
-       # self._forced_transcript: str | None = None
         super().__init__(
             instructions=(
                 "Eres Pika, un amigo tipo Pikachu para niños pequeños. "
@@ -341,10 +339,7 @@ class PikaAgent(Agent):
                 )
             
         )
-        self._vision_gate = asyncio.Event()       # when SET => block speech
-        self._forced_transcript: str | None = None
-        self._cam_gate = asyncio.Event()
-        self._forced_ready = asyncio.Event()      # fires when forced text is ready
+        self._camera_lock = asyncio.Lock()
         self._last_photo_path: Path | None = None
         self._last_data_url: str | None = None
 
@@ -393,21 +388,6 @@ class PikaAgent(Agent):
                 await asyncio.wait_for(waiter(), timeout=2.0)
             except Exception:
                 pass
-    async def _speak_gate_wait_and_yield(self) -> AsyncIterable[str]:
-        """Wait until tool provides forced text, then yield exactly that."""
-        try:
-            await asyncio.wait_for(self._forced_ready.wait(), timeout=15.0)
-        except asyncio.TimeoutError:
-            # fallback: nothing to say (stay silent rather than hallucinate)
-            return
-        text = self._forced_transcript or ""
-        # clear for next use
-        self._forced_transcript = None
-        self._forced_ready.clear()
-        self._vision_gate.clear()
-        if text:
-            yield text
-
     # Tiny state toggle the model can call when it hears the wake/stop words.
     @function_tool(description="Activa o desactiva el modo 'despierto' del asistente.")
     async def set_awake(self, context: RunContext, awake: bool) -> str:
@@ -577,51 +557,44 @@ class PikaAgent(Agent):
     async def take_photo(self, context: RunContext, question: str | None = None) -> dict:
         if not self._awake:
             return {"error": "Estoy dormido por ahora."}
-        self._vision_gate.set()
-        self._cam_gate.set()
-        tmp = Path("/tmp") / f"pika_{int(datetime.datetime.now().timestamp())}.jpg"
+        async with self._camera_lock:
+            tmp = Path("/tmp") / f"pika_{int(datetime.datetime.now().timestamp())}.jpg"
 
-        def snap() -> None:
-            cmd = [
-                "fswebcam", "-d", "/dev/video0",
-                "-r", f"{PHOTO_W}x{PHOTO_H}", "--no-banner", str(tmp)
-            ]
-            subprocess.run(cmd, check=True)
+            def snap() -> None:
+                cmd = [
+                    "fswebcam", "-d", "/dev/video0",
+                    "-r", f"{PHOTO_W}x{PHOTO_H}", "--no-banner", str(tmp)
+                ]
+                subprocess.run(cmd, check=True)
 
-        # captura con reintento
-        try:
-            await asyncio.to_thread(snap)
-        except Exception:
-            import time
-            await asyncio.sleep(0.3)
-            await asyncio.to_thread(snap)
+            # captura con reintento
+            try:
+                await asyncio.to_thread(snap)
+            except Exception:
+                import time
+                await asyncio.sleep(0.3)
+                await asyncio.to_thread(snap)
 
-        #if not tmp.exists() or tmp.stat().st_size < 1024:
-         #   return {"udo vim age  rror": "La foto salió vacía. Probá de nuevo."}
+            img_bytes = await asyncio.to_thread(tmp.read_bytes)
+            if SAVE_DIRS:
+                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                out = Path(SAVE_DIRS[0]).expanduser() / f"photo_{ts}.jpg"
+                with contextlib.suppress(Exception):
+                    out.write_bytes(img_bytes)
 
-        # archivo y data URL
-        img_bytes = await asyncio.to_thread(tmp.read_bytes)
-        if SAVE_DIRS:
-            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            out = Path(SAVE_DIRS[0]).expanduser() / f"photo_{ts}.jpg"
-            with contextlib.suppress(Exception):
-                out.write_bytes(img_bytes)
+            data_url = "data:image/jpeg;base64," + base64.b64encode(img_bytes).decode("ascii")
+            self._last_photo_path = tmp
+            self._last_data_url = data_url
 
-        data_url = "data:image/jpeg;base64," + base64.b64encode(img_bytes).decode("ascii")
-        # guardamos como "última foto" para consultas posteriores
-        self._last_photo_path = tmp
-        self._last_data_url = data_url
-        
-        # análisis de visión (general/por pregunta)
-        try:
-            result = await self._vision_analyze(data_url, question)
-            if inspect.isawaitable(result):
-                result = await result
-        except Exception as e:
-            result = {
-                "answer": f"No pude analizar bien la imagen ({e}). Probemos con más luz y acercando el objeto.",
-                "objects": [], "pokemon": None, "text": "", "brands": [], "scene_tags": [], "confidence": "baja",
-            }
+            try:
+                result = await self._vision_analyze(data_url, question)
+                if inspect.isawaitable(result):
+                    result = await result
+            except Exception as e:
+                result = {
+                    "answer": f"No pude analizar bien la imagen ({e}). Probemos con más luz y acercando el objeto.",
+                    "objects": [], "pokemon": None, "text": "", "brands": [], "scene_tags": [], "confidence": "baja",
+                }
 
         speak = self._extract_answer_text(result)
         if not speak:
@@ -629,19 +602,11 @@ class PikaAgent(Agent):
         if isinstance(result, dict):
             result["answer"] = speak
             result["assistant_response"] = speak
-        session = getattr(context, "session", None)
-        try:
-            if session is not None:
-                await self._interrupt_safely(session)
-            if speak:
-                self._forced_transcript = speak
-                self._forced_ready.set()
-        finally:
-            self._cam_gate.clear()
-            self._vision_gate.clear()
 
-        if speak:
-            await self._say_via_session(session, speak, allow_fallback=True)
+        session = getattr(context, "session", None)
+        if session is not None:
+            await self._interrupt_safely(session)
+        await self._say_via_session(session, speak, allow_fallback=True)
         # respuesta pensada para *hablar*
         return {
             "assistant_response": speak,
@@ -685,10 +650,7 @@ class PikaAgent(Agent):
         session = getattr(context, "session", None)
         if session is not None:
             await self._interrupt_safely(session)
-        if speak:
-            self._forced_transcript = speak
-            self._forced_ready.set()
-            await self._say_via_session(session, speak, allow_fallback=True)
+        await self._say_via_session(session, speak, allow_fallback=True)
         return {
             "assistant_response": speak,
             "answer": speak,
@@ -748,26 +710,6 @@ class PikaAgent(Agent):
     async def _vision_analyze(self, data_url: str, question: str | None) -> dict:
         """Runs the blocking vision request off the event loop."""
         return await asyncio.to_thread(self._vision_analyze_sync, data_url, question)
-    # Hook A: Some versions route through "text output" (pre-TTS)
-    async def text_output_node(self, text, model_settings):
-        if self._cam_gate.is_set():
-            async for _ in text:  # drain model stream
-                pass
-            async for delta in self._speak_gate_wait_and_yield():
-                yield delta
-            return
-        async for delta in text:
-            yield delta
-
-    async def transcription_node(self, text, model_settings):
-        if self._cam_gate.is_set():
-            async for _ in text:
-                pass
-            async for delta in self._speak_gate_wait_and_yield():
-                yield delta
-            return
-        async for delta in text:
-            yield delta
     # version-agnostic "stop talking now" helper
     async def _interrupt_safely(self, session):
         """
