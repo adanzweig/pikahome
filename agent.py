@@ -344,6 +344,24 @@ class PikaAgent(Agent):
         self._forced_transcript: str | None = None
         self._cam_gate = asyncio.Event()
         self._forced_ready = asyncio.Event()      # fires when forced text is ready
+        self._last_photo_path: Path | None = None
+        self._last_data_url: str | None = None
+
+    @staticmethod
+    def _extract_answer_text(result: dict) -> str:
+        if not isinstance(result, dict):
+            return ""
+        for key in ("answer", "assistant_response", "response", "caption", "description"):
+            value = result.get(key)
+            if not value:
+                continue
+            if isinstance(value, str):
+                text = value.strip()
+            else:
+                text = str(value).strip()
+            if text:
+                return text
+        return ""
 
     async def _say_via_session(
         self,
@@ -388,17 +406,18 @@ class PikaAgent(Agent):
         self._vision_gate.clear()
         if text:
             yield text
+
     # Tiny state toggle the model can call when it hears the wake/stop words.
     @function_tool(description="Activa o desactiva el modo 'despierto' del asistente.")
     async def set_awake(self, context: RunContext, awake: bool) -> str:
         was = self._awake
         self._awake = bool(awake)
         session = getattr(context, "session", None)
-        if self._awake and not was:
+        # if self._awake and not was:
             # optional: say a short confirmation
-            await self._say_via_session(session, "¡Pika! ¿En qué te ayudo?", allow_fallback=True)
-        elif (not self._awake) and was:
-            await self._say_via_session(session, "Hasta luego. Pika.", allow_fallback=True)
+            # await self._say_via_session(session, "¡Pika! ¿En qué te ayudo?", allow_fallback=True)
+        # elif (not self._awake) and was:
+            # await self._say_via_session(session, "Hasta luego. Pika.", allow_fallback=True)
         return f"awake={self._awake}"
 
     @function_tool(
@@ -603,7 +622,12 @@ class PikaAgent(Agent):
                 "objects": [], "pokemon": None, "text": "", "brands": [], "scene_tags": [], "confidence": "baja",
             }
 
-        speak = result.get("answer", "")
+        speak = self._extract_answer_text(result)
+        if not speak:
+            speak = "No pude analizar bien la imagen. Probemos con más luz y acercando el objeto."
+        if isinstance(result, dict):
+            result["answer"] = speak
+            result["assistant_response"] = speak
         session = getattr(context, "session", None)
         try:
             if session is not None:
@@ -617,8 +641,8 @@ class PikaAgent(Agent):
             self._vision_gate.clear()
         # respuesta pensada para *hablar*
         return {
-            "assistant_response":result["answer"],
-            "answer": result["answer"],
+            "assistant_response": speak,
+            "answer": speak,
             "objects": result.get("objects", []),
             "pokemon": result.get("pokemon"),
             "text": result.get("text", ""),
@@ -650,12 +674,17 @@ class PikaAgent(Agent):
                 "answer": f"No pude analizar bien la imagen ({e}). Probemos con más luz y acercando el objeto.",
                 "objects": [], "pokemon": None, "text": "", "brands": [], "scene_tags": [], "confidence": "baja",
             }
-        if result.get("answer"):
-            self._forced_transcript = result["answer"]
+        speak = self._extract_answer_text(result)
+        if not speak:
+            speak = "No pude analizar bien la imagen. Probemos con más luz y acercando el objeto."
+        result["answer"] = speak
+        result["assistant_response"] = speak
+        if speak:
+            self._forced_transcript = speak
             self._forced_ready.set()
         return {
-            "assistant_response":result["answer"],
-            "answer": result["answer"],
+            "assistant_response": speak,
+            "answer": speak,
             "objects": result.get("objects", []),
             "pokemon": result.get("pokemon"),
             "text": result.get("text", ""),
