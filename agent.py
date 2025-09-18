@@ -16,6 +16,7 @@ from livekit.agents import (
     ModelSettings
 )
 from livekit.plugins import openai  # Realtime model lives here
+from livekit.agents.llm.tool_context import StopResponse
 
 # Spotify
 import spotipy
@@ -363,10 +364,13 @@ class PikaAgent(Agent):
         allow_fallback: bool = False,
         context: RunContext | None = None,
         await_playout: bool = False,
+        allow_when_asleep: bool = False,
     ) -> None:
         """Speak using the realtime voice, falling back to local TTS if allowed."""
         text = (text or "").strip()
         if not text:
+            return
+        if not allow_when_asleep and not self._awake:
             return
         if session is None:
             _log("skip speech (no active session)")
@@ -459,6 +463,22 @@ class PikaAgent(Agent):
         except Exception:
             pass
 
+    async def text_output_node(self, text, model_settings):
+        if not self._awake:
+            async for _ in text:
+                pass
+            return
+        async for delta in text:
+            yield delta
+
+    async def transcription_node(self, text, model_settings):
+        if not self._awake:
+            async for _ in text:
+                pass
+            return
+        async for delta in text:
+            yield delta
+
     def _spotify_device(self, sp) -> dict | None:
         try:
             devices = sp.devices() or {}
@@ -495,22 +515,25 @@ class PikaAgent(Agent):
     @function_tool(description="Activa o desactiva el modo 'despierto' del asistente.")
     async def set_awake(self, context: RunContext, awake: bool) -> str:
         was = self._awake
-        self._awake = bool(awake)
+        new_state = bool(awake)
         session = getattr(context, "session", None)
-        if self._awake and not was:
+        if not was and new_state:
             await self._say_via_session(
                 session,
                 "¡Pika! ¿En qué te ayudo?",
                 allow_fallback=True,
                 context=context,
+                allow_when_asleep=True,
             )
-        elif (not self._awake) and was:
+        elif was and not new_state:
             await self._say_via_session(
                 session,
                 "Hasta luego. Pika.",
                 allow_fallback=True,
                 context=context,
+                allow_when_asleep=True,
             )
+        self._awake = new_state
         return f"awake={self._awake}"
 
     @function_tool(
@@ -520,7 +543,7 @@ class PikaAgent(Agent):
     )
     async def play_music(self, context: RunContext, query: str) -> str:
         if not self._awake:
-            return "Estoy dormido por ahora."
+            raise StopResponse()
         sp = get_spotify()
         if not sp:
             return "Spotify no está configurado."
@@ -612,9 +635,11 @@ class PikaAgent(Agent):
     async def pause_music(self, context: RunContext) -> str:
         last_cmd, last_ts = self._last_music_command
         if last_cmd == "play_music" and (time.time() - last_ts) < 6:
-            return "Todavía estoy reproduciendo. Si querés que pare, decímelo otra vez."  
+            return "Todavía estoy reproduciendo. Si querés que pare, decímelo otra vez."
         sp = get_spotify()
         if not sp: return "Spotify no está configurado."
+        if not self._awake:
+            raise StopResponse()
         try:
             device = self._spotify_device(sp)
         except SpotifyOauthError:
@@ -634,9 +659,11 @@ class PikaAgent(Agent):
 
     @function_tool(description="Reanuda la música en Spotify (ej: 'seguí', 'reanudar').")
     async def resume_music(self, context: RunContext) -> str:
+        if not self._awake:
+            raise StopResponse()
         last_cmd, last_ts = self._last_music_command
         if last_cmd == "pause_music" and (time.time() - last_ts) < 2:
-            return "Ya la tengo pausada, avisame cuando quieras seguir."  
+            return "Ya la tengo pausada, avisame cuando quieras seguir."
         sp = get_spotify()
         if not sp: return "Spotify no está configurado."
         try:
@@ -660,6 +687,8 @@ class PikaAgent(Agent):
     async def next_track(self, context: RunContext) -> str:
         sp = get_spotify()
         if not sp: return "Spotify no está configurado."
+        if not self._awake:
+            raise StopResponse()
         try:
             device = self._spotify_device(sp)
         except SpotifyOauthError:
@@ -681,6 +710,8 @@ class PikaAgent(Agent):
     async def previous_track(self, context: RunContext) -> str:
         sp = get_spotify()
         if not sp: return "Spotify no está configurado."
+        if not self._awake:
+            raise StopResponse()
         try:
             device = self._spotify_device(sp)
         except SpotifyOauthError:
@@ -702,6 +733,8 @@ class PikaAgent(Agent):
     async def set_volume(self, context: RunContext, volume: int) -> str:
         sp = get_spotify()
         if not sp: return "Spotify no está configurado."
+        if not self._awake:
+            raise StopResponse()
         try:
             device = self._spotify_device(sp)
         except SpotifyOauthError:
@@ -723,6 +756,8 @@ class PikaAgent(Agent):
     async def set_shuffle(self, context: RunContext, enabled: bool) -> str:
         sp = get_spotify()
         if not sp: return "Spotify no está configurado."
+        if not self._awake:
+            raise StopResponse()
         try:
             device = self._spotify_device(sp)
         except SpotifyOauthError:
@@ -743,6 +778,8 @@ class PikaAgent(Agent):
     async def set_repeat(self, context: RunContext, mode: str) -> str:
         sp = get_spotify()
         if not sp: return "Spotify no está configurado."
+        if not self._awake:
+            raise StopResponse()
         try:
             device = self._spotify_device(sp)
         except SpotifyOauthError:
@@ -771,7 +808,7 @@ class PikaAgent(Agent):
     )
     async def take_photo(self, context: RunContext, question: str | None = None) -> dict:
         if not self._awake:
-            return {"error": "Estoy dormido por ahora."}
+            raise StopResponse()
         await self._wait_for_active_playout(context)
         session = getattr(context, "session", None)
         await self._say_via_session(
@@ -849,7 +886,7 @@ class PikaAgent(Agent):
     )
     async def ask_about_photo(self, context: RunContext, question: str) -> dict:
         if not self._awake:
-            return {"error": "Estoy dormido por ahora."}
+            raise StopResponse()
         if not self._last_data_url:
             return {"error": "No tengo una foto reciente. Decime: 'sacá una foto'."}
         await self._wait_for_active_playout(context)
