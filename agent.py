@@ -803,6 +803,14 @@ async def entrypoint(ctx: agents.JobContext):
         llm=openai.realtime.RealtimeModel(
             model=REALTIME_MODEL,
             voice=OPENAI_VOICE
+            turn_detection=TurnDetection(
+                type="server_vad",
+                threshold=0.5,
+                prefix_padding_ms=300,
+                silence_duration_ms=500,
+                create_response=True,
+                interrupt_response=True,
+            )
             # You can configure turn detection via the plugin if you want;
             # OpenAI Realtime has built-in VAD/turn-detection by default.
         ),
@@ -812,14 +820,7 @@ async def entrypoint(ctx: agents.JobContext):
         room=ctx.room,
         agent=PikaAgent(),
         room_input_options=RoomInputOptions(),  # add noise cancellation if you enable that plugin
-        turn_detection=TurnDetection(
-            type="server_vad",
-            threshold=0.5,
-            prefix_padding_ms=300,
-            silence_duration_ms=500,
-            create_response=True,
-            interrupt_response=True,
-        )
+        
     )
 
 if __name__ == "__main__":
