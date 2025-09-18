@@ -19,7 +19,7 @@ from livekit.plugins import openai  # Realtime model lives here
 # Spotify
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
-from spotipy.exceptions import SpotifyOauthError
+from spotipy.exceptions import SpotifyOauthError, SpotifyException
 import inspect
 import tempfile,contextlib
 import re
@@ -54,6 +54,12 @@ SPOTIFY_REDIRECT_URI  = os.getenv("SPOTIFY_REDIRECT_URI", "http://localhost:8888
 SPOTIFY_DEVICE_NAME   = os.getenv("SPOTIFY_DEVICE_NAME", "pikahome")
 SPOTIFY_AUTH_ERROR_MSG = (
     "Spotify necesita que vuelvas a iniciar sesión. Abrí el setup de Spotify y autorizá de nuevo, porfi."
+)
+SPOTIFY_DEVICE_PROMPT = (
+    "No veo el parlante 'pikahome'. Abrí Spotify, elegí ese parlante y probemos de nuevo."
+)
+SPOTIFY_RESTRICTED_MSG = (
+    "Spotify está usando otro dispositivo y no me deja controlarlo. Elegí 'pikahome' y volvemos a intentar."
 )
 
 # --- Camera env ---
@@ -239,23 +245,6 @@ def _smart_search(sp, query: str, market: str = "AR"):
         a = res["albums"]["items"][0]; return ("album", a["uri"], a["name"], None)
 
     return (None, None, None, None)
-def _pick_device(sp) -> str | None:
-    try:
-        devices = sp.devices() or {}
-    except SpotifyOauthError:
-        raise
-    devs = devices.get("devices", [])
-    if not devs: return None
-    name = (SPOTIFY_DEVICE_NAME or "").lower()
-    did = None
-    active = None
-    for d in devs:
-        if d.get("is_active"):
-            active = d.get("id")
-        if name and d.get("name","").lower() == name:
-            did = d.get("id")
-    return did or active or devs[0].get("id")
-
 def _is_playing_on(sp, device_id: str) -> bool:
     try:
         pb = sp.current_playback()
@@ -304,10 +293,14 @@ def _log(*a):
     except Exception:
         pass
 
+class SpotifyDeviceRestricted(Exception):
+    """Raised when the target Spotify device refuses remote control."""
+
 class PikaAgent(Agent):
     def __init__(self) -> None:
         # We’ll keep a minimal “awake” flag the model can toggle via a tool.
         self._awake = False
+        self._spotify_device_id: str | None = None
         super().__init__(
             instructions=(
                 "Eres Pika, un amigo tipo Pikachu para niños pequeños. "
@@ -463,6 +456,39 @@ class PikaAgent(Agent):
             await asyncio.wait_for(waiter(), timeout=timeout)
         except Exception:
             pass
+
+    def _spotify_device(self, sp) -> dict | None:
+        try:
+            devices = sp.devices() or {}
+        except SpotifyOauthError:
+            raise
+        devs = devices.get("devices", [])
+        if not devs:
+            self._spotify_device_id = None
+            return None
+
+        target_name = (SPOTIFY_DEVICE_NAME or "").lower()
+        target = None
+        for device in devs:
+            if target_name and device.get("name", "").lower() == target_name:
+                target = device
+                break
+
+        if target is None and self._spotify_device_id:
+            for device in devs:
+                if device.get("id") == self._spotify_device_id:
+                    target = device
+                    break
+
+        if target is None:
+            self._spotify_device_id = None
+            return None
+
+        if target.get("is_restricted"):
+            raise SpotifyDeviceRestricted()
+
+        self._spotify_device_id = target.get("id")
+        return target
     # Tiny state toggle the model can call when it hears the wake/stop words.
     @function_tool(description="Activa o desactiva el modo 'despierto' del asistente.")
     async def set_awake(self, context: RunContext, awake: bool) -> str:
@@ -498,25 +524,31 @@ class PikaAgent(Agent):
             return "Spotify no está configurado."
 
         try:
-            did = _pick_device(sp)
+            device = self._spotify_device(sp)
         except SpotifyOauthError:
             return SPOTIFY_AUTH_ERROR_MSG
-        if not did:
-            return ("No veo dispositivos de Spotify. Abrí Spotify en tu celu/PC, "
-                "elegí 'pikahome' y volvé a pedirme música.")
+        except SpotifyDeviceRestricted:
+            return SPOTIFY_RESTRICTED_MSG
+        if not device:
+            return SPOTIFY_DEVICE_PROMPT
 
+        did = device["id"]
+
+        title = None
         try:
-            # foco + volumen
-            try: sp.transfer_playback(device_id=did)
-            except Exception: pass
-            try: sp.volume(75, device_id=did)
-            except Exception: pass
+            try:
+                sp.transfer_playback(device_id=did)
+            except SpotifyException:
+                pass
+            try:
+                sp.volume(75, device_id=did)
+            except SpotifyException:
+                pass
 
             kind, uri_or_uris, title, _ = _smart_search(sp, query, market=os.getenv("SPOTIFY_MARKET","AR"))
             if not kind:
                 return "No encontré eso en Spotify."
 
-            # ejecutar según el tipo
             try:
                 if kind == "tracklist":
                     sp.start_playback(device_id=did, uris=uri_or_uris)
@@ -525,9 +557,8 @@ class PikaAgent(Agent):
                 elif kind in ("track", "episode"):
                     sp.start_playback(device_id=did, uris=[uri_or_uris])
                 else:
-                    sp.start_playback(device_id=did)  # reanudar contexto si quedara algo
-            except Exception:
-                # pequeño wake-up y reintento
+                    sp.start_playback(device_id=did)
+            except SpotifyException:
                 try:
                     sp.transfer_playback(device_id=did)
                     sp.start_playback(device_id=did)
@@ -537,7 +568,7 @@ class PikaAgent(Agent):
                         sp.start_playback(device_id=did, context_uri=uri_or_uris)
                     elif kind in ("track", "episode"):
                         sp.start_playback(device_id=did, uris=[uri_or_uris])
-                except Exception:
+                except SpotifyException:
                     pass
         except SpotifyOauthError:
             return SPOTIFY_AUTH_ERROR_MSG
@@ -554,16 +585,19 @@ class PikaAgent(Agent):
         sp = get_spotify()
         if not sp: return "Spotify no está configurado."
         try:
-            did = _pick_device(sp)
+            device = self._spotify_device(sp)
         except SpotifyOauthError:
             return SPOTIFY_AUTH_ERROR_MSG
-        if not did: return "No veo el parlante 'pikahome'."
+        except SpotifyDeviceRestricted:
+            return SPOTIFY_RESTRICTED_MSG
+        if not device: return SPOTIFY_DEVICE_PROMPT
+        did = device["id"]
         try:
             sp.pause_playback(device_id=did)
             return "Listo, paro la música."
-        except SpotifyOauthError:
-            return SPOTIFY_AUTH_ERROR_MSG
-        except Exception:
+        except SpotifyException as exc:
+            if getattr(exc, "http_status", None) == 403:
+                return SPOTIFY_RESTRICTED_MSG
             return "No pude pausar. Probemos de nuevo."
 
     @function_tool(description="Reanuda la música en Spotify (ej: 'seguí', 'reanudar').")
@@ -571,16 +605,19 @@ class PikaAgent(Agent):
         sp = get_spotify()
         if not sp: return "Spotify no está configurado."
         try:
-            did = _pick_device(sp)
+            device = self._spotify_device(sp)
         except SpotifyOauthError:
             return SPOTIFY_AUTH_ERROR_MSG
-        if not did: return "No veo el parlante 'pikahome'."
+        except SpotifyDeviceRestricted:
+            return SPOTIFY_RESTRICTED_MSG
+        if not device: return SPOTIFY_DEVICE_PROMPT
+        did = device["id"]
         try:
-            sp.start_playback(device_id=did)  # resume current context
+            sp.start_playback(device_id=did)
             return "Sigo con la música."
-        except SpotifyOauthError:
-            return SPOTIFY_AUTH_ERROR_MSG
-        except Exception:
+        except SpotifyException as exc:
+            if getattr(exc, "http_status", None) == 403:
+                return SPOTIFY_RESTRICTED_MSG
             return "No pude seguir. Probemos de nuevo."
 
     @function_tool(description="Pasa a la siguiente canción (ej: 'cambiá de canción', 'poné otra').")
@@ -588,16 +625,19 @@ class PikaAgent(Agent):
         sp = get_spotify()
         if not sp: return "Spotify no está configurado."
         try:
-            did = _pick_device(sp)
+            device = self._spotify_device(sp)
         except SpotifyOauthError:
             return SPOTIFY_AUTH_ERROR_MSG
-        if not did: return "No veo el parlante 'pikahome'."
+        except SpotifyDeviceRestricted:
+            return SPOTIFY_RESTRICTED_MSG
+        if not device: return SPOTIFY_DEVICE_PROMPT
+        did = device["id"]
         try:
             sp.next_track(device_id=did)
             return "Listo, cambio de canción."
-        except SpotifyOauthError:
-            return SPOTIFY_AUTH_ERROR_MSG
-        except Exception:
+        except SpotifyException as exc:
+            if getattr(exc, "http_status", None) == 403:
+                return SPOTIFY_RESTRICTED_MSG
             return "No pude cambiar. Probemos de nuevo."
 
     @function_tool(description="Vuelve a la canción anterior.")
@@ -605,16 +645,19 @@ class PikaAgent(Agent):
         sp = get_spotify()
         if not sp: return "Spotify no está configurado."
         try:
-            did = _pick_device(sp)
+            device = self._spotify_device(sp)
         except SpotifyOauthError:
             return SPOTIFY_AUTH_ERROR_MSG
-        if not did: return "No veo el parlante 'pikahome'."
+        except SpotifyDeviceRestricted:
+            return SPOTIFY_RESTRICTED_MSG
+        if not device: return SPOTIFY_DEVICE_PROMPT
+        did = device["id"]
         try:
             sp.previous_track(device_id=did)
             return "Vuelvo a la anterior."
-        except SpotifyOauthError:
-            return SPOTIFY_AUTH_ERROR_MSG
-        except Exception:
+        except SpotifyException as exc:
+            if getattr(exc, "http_status", None) == 403:
+                return SPOTIFY_RESTRICTED_MSG
             return "No pude volver. Probemos de nuevo."
 
     @function_tool(description="Ajusta el volumen (0 a 100).")
@@ -622,17 +665,20 @@ class PikaAgent(Agent):
         sp = get_spotify()
         if not sp: return "Spotify no está configurado."
         try:
-            did = _pick_device(sp)
+            device = self._spotify_device(sp)
         except SpotifyOauthError:
             return SPOTIFY_AUTH_ERROR_MSG
-        if not did: return "No veo el parlante 'pikahome'."
+        except SpotifyDeviceRestricted:
+            return SPOTIFY_RESTRICTED_MSG
+        if not device: return SPOTIFY_DEVICE_PROMPT
+        did = device["id"]
         vol = max(0, min(100, int(volume)))
         try:
             sp.volume(vol, device_id=did)
             return f"Volumen a {vol}%."
-        except SpotifyOauthError:
-            return SPOTIFY_AUTH_ERROR_MSG
-        except Exception:
+        except SpotifyException as exc:
+            if getattr(exc, "http_status", None) == 403:
+                return SPOTIFY_RESTRICTED_MSG
             return "No pude cambiar el volumen."
 
     @function_tool(description="Activa o desactiva el modo aleatorio (shuffle).")
@@ -640,16 +686,19 @@ class PikaAgent(Agent):
         sp = get_spotify()
         if not sp: return "Spotify no está configurado."
         try:
-            did = _pick_device(sp)
+            device = self._spotify_device(sp)
         except SpotifyOauthError:
             return SPOTIFY_AUTH_ERROR_MSG
-        if not did: return "No veo el parlante 'pikahome'."
+        except SpotifyDeviceRestricted:
+            return SPOTIFY_RESTRICTED_MSG
+        if not device: return SPOTIFY_DEVICE_PROMPT
+        did = device["id"]
         try:
             sp.shuffle(enabled, device_id=did)
             return "Mezclo las canciones." if enabled else "Saco el modo aleatorio."
-        except SpotifyOauthError:
-            return SPOTIFY_AUTH_ERROR_MSG
-        except Exception:
+        except SpotifyException as exc:
+            if getattr(exc, "http_status", None) == 403:
+                return SPOTIFY_RESTRICTED_MSG
             return "No pude cambiar el modo aleatorio."
 
     @function_tool(description="Configura el modo repetir: 'track', 'context' o 'off'.")
@@ -657,19 +706,22 @@ class PikaAgent(Agent):
         sp = get_spotify()
         if not sp: return "Spotify no está configurado."
         try:
-            did = _pick_device(sp)
+            device = self._spotify_device(sp)
         except SpotifyOauthError:
             return SPOTIFY_AUTH_ERROR_MSG
-        if not did: return "No veo el parlante 'pikahome'."
+        except SpotifyDeviceRestricted:
+            return SPOTIFY_RESTRICTED_MSG
+        if not device: return SPOTIFY_DEVICE_PROMPT
+        did = device["id"]
         mode = (mode or "off").lower()
         if mode not in ("track","context","off"):
             mode = "off"
         try:
             sp.repeat(mode, device_id=did)
             return f"Repito: {mode}."
-        except SpotifyOauthError:
-            return SPOTIFY_AUTH_ERROR_MSG
-        except Exception:
+        except SpotifyException as exc:
+            if getattr(exc, "http_status", None) == 403:
+                return SPOTIFY_RESTRICTED_MSG
             return "No pude cambiar el modo repetir."
 
     @function_tool(
