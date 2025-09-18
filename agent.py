@@ -375,30 +375,27 @@ class PikaAgent(Agent):
                 await _say_local_exact(text)
             return
         try:
-            handle = await session.say(text)
+            handle = session.say(text)
         except Exception as exc:
             _log("session.say failed", exc)
             if allow_fallback and USE_LOCAL_TTS_FALLBACK:
                 await _say_local_exact(text)
             return
 
-        waiter = getattr(handle, "wait", None) or getattr(handle, "wait_for_completion", None)
-        if callable(waiter):
-            try:
-                await asyncio.wait_for(waiter(), timeout=2.0)
-            except Exception:
-                pass
+        wait_coro = getattr(handle, "wait_for_playout", None)
+        if callable(wait_coro):
+            # fire-and-forget so we don't block this tool while the audio finishes
+            asyncio.create_task(asyncio.shield(wait_coro()))
     # Tiny state toggle the model can call when it hears the wake/stop words.
     @function_tool(description="Activa o desactiva el modo 'despierto' del asistente.")
     async def set_awake(self, context: RunContext, awake: bool) -> str:
         was = self._awake
         self._awake = bool(awake)
         session = getattr(context, "session", None)
-        # if self._awake and not was:
-            # optional: say a short confirmation
-            # await self._say_via_session(session, "¡Pika! ¿En qué te ayudo?", allow_fallback=True)
-        # elif (not self._awake) and was:
-            # await self._say_via_session(session, "Hasta luego. Pika.", allow_fallback=True)
+        if self._awake and not was:
+            await self._say_via_session(session, "¡Pika! ¿En qué te ayudo?", allow_fallback=True)
+        elif (not self._awake) and was:
+            await self._say_via_session(session, "Hasta luego. Pika.", allow_fallback=True)
         return f"awake={self._awake}"
 
     @function_tool(
@@ -604,8 +601,6 @@ class PikaAgent(Agent):
             result["assistant_response"] = speak
 
         session = getattr(context, "session", None)
-        if session is not None:
-            await self._interrupt_safely(session)
         await self._say_via_session(session, speak, allow_fallback=True)
         # respuesta pensada para *hablar*
         return {
@@ -648,8 +643,6 @@ class PikaAgent(Agent):
         result["answer"] = speak
         result["assistant_response"] = speak
         session = getattr(context, "session", None)
-        if session is not None:
-            await self._interrupt_safely(session)
         await self._say_via_session(session, speak, allow_fallback=True)
         return {
             "assistant_response": speak,
