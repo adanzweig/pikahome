@@ -802,7 +802,7 @@ async def entrypoint(ctx: agents.JobContext):
     session = AgentSession(
         llm=openai.realtime.RealtimeModel(
             model=REALTIME_MODEL,
-            voice=OPENAI_VOICE
+            voice=OPENAI_VOICE,
             turn_detection=TurnDetection(
                 type="server_vad",
                 threshold=0.5,
@@ -819,8 +819,7 @@ async def entrypoint(ctx: agents.JobContext):
     await session.start(
         room=ctx.room,
         agent=PikaAgent(),
-        room_input_options=RoomInputOptions(),  # add noise cancellation if you enable that plugin
-        
+        room_input_options=RoomInputOptions(),  # add noise cancellation if you enable that plugin   
     )
 
 if __name__ == "__main__":
