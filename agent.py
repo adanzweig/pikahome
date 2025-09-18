@@ -63,17 +63,9 @@ OUTPUT_ALSA_DEVICE = os.getenv("OUTPUT_ALSA_DEVICE") or "plughw:3,0"
 TTS_LANG = os.getenv("TTS_LANG", "es-ES")                  # for pico2wave/espeak
 
 async def _say_local_exact(text: str, device: str | None = None):
-    """
-    Make a wav and play it via ALSA, with robust fallbacks:
-      1) OpenAI TTS (streaming)  -> wav
-      2) pico2wave (offline)     -> wav
-      3) espeak-ng (offline)     -> wav
-    """
+    """Legacy local speech fallback (espeak-ng). Kept for debugging."""
     if not text:
         return
-   # import subprocess
-
-#text = "Hola! Probando audio."
     espeak = subprocess.Popen(
         ["espeak-ng", "-v", "es-la", "-s", "170", "--stdout"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE
@@ -371,15 +363,12 @@ class PikaAgent(Agent):
         if not text:
             return
         if session is None:
-            if allow_fallback and USE_LOCAL_TTS_FALLBACK:
-                await _say_local_exact(text)
+            _log("skip speech (no active session)")
             return
         try:
             handle = session.say(text)
         except Exception as exc:
             _log("session.say failed", exc)
-            if allow_fallback and USE_LOCAL_TTS_FALLBACK:
-                await _say_local_exact(text)
             return
 
         wait_coro = getattr(handle, "wait_for_playout", None)
@@ -554,6 +543,10 @@ class PikaAgent(Agent):
     async def take_photo(self, context: RunContext, question: str | None = None) -> dict:
         if not self._awake:
             return {"error": "Estoy dormido por ahora."}
+        with contextlib.suppress(Exception):
+            context.disallow_interruptions()
+        session = getattr(context, "session", None)
+        await self._say_via_session(session, "Mmm... dejame ver un segundito.")
         async with self._camera_lock:
             tmp = Path("/tmp") / f"pika_{int(datetime.datetime.now().timestamp())}.jpg"
 
@@ -600,7 +593,6 @@ class PikaAgent(Agent):
             result["answer"] = speak
             result["assistant_response"] = speak
 
-        session = getattr(context, "session", None)
         await self._say_via_session(session, speak, allow_fallback=True)
         # respuesta pensada para *hablar*
         return {
@@ -627,6 +619,8 @@ class PikaAgent(Agent):
             return {"error": "Estoy dormido por ahora."}
         if not self._last_data_url:
             return {"error": "No tengo una foto reciente. Decime: 'sacá una foto'."}
+        with contextlib.suppress(Exception):
+            context.disallow_interruptions()
 
         try:
             result = await self._vision_analyze(self._last_data_url, question)
