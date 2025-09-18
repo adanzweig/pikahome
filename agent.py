@@ -1,6 +1,7 @@
 #!/usr/bin/env/ python3
 # LiveKit Agents v1: AgentSession + Agent + OpenAI Realtime + Spotify + Camera
 import os, asyncio, base64, subprocess, datetime, sys, fcntl
+import time
 from pathlib import Path
 from dotenv import load_dotenv
 import contextlib
@@ -301,6 +302,7 @@ class PikaAgent(Agent):
         # We’ll keep a minimal “awake” flag the model can toggle via a tool.
         self._awake = False
         self._spotify_device_id: str | None = None
+        self._last_music_command: tuple[str, float] = ("", 0.0)
         super().__init__(
             instructions=(
                 "Eres Pika, un amigo tipo Pikachu para niños pequeños. "
@@ -600,6 +602,7 @@ class PikaAgent(Agent):
 
         if _nudge_and_verify(sp, did):
             nice = title or query
+            self._last_music_command = ("play_music", time.time())
             return f"Reproduciendo {nice} en Spotify."
         else:
             return ("Intenté reproducir pero no empezó. En tu Spotify elegí 'pikahome', "
@@ -607,6 +610,9 @@ class PikaAgent(Agent):
 
     @function_tool(description="Pausa la música en Spotify (ej: 'basta', 'pará').")
     async def pause_music(self, context: RunContext) -> str:
+        last_cmd, last_ts = self._last_music_command
+        if last_cmd == "play_music" and (time.time() - last_ts) < 6:
+            return "Todavía estoy reproduciendo. Si querés que pare, decímelo otra vez."  
         sp = get_spotify()
         if not sp: return "Spotify no está configurado."
         try:
@@ -619,6 +625,7 @@ class PikaAgent(Agent):
         did = device["id"]
         try:
             sp.pause_playback(device_id=did)
+            self._last_music_command = ("pause_music", time.time())
             return "Listo, paro la música."
         except SpotifyException as exc:
             if getattr(exc, "http_status", None) == 403:
@@ -627,6 +634,9 @@ class PikaAgent(Agent):
 
     @function_tool(description="Reanuda la música en Spotify (ej: 'seguí', 'reanudar').")
     async def resume_music(self, context: RunContext) -> str:
+        last_cmd, last_ts = self._last_music_command
+        if last_cmd == "pause_music" and (time.time() - last_ts) < 2:
+            return "Ya la tengo pausada, avisame cuando quieras seguir."  
         sp = get_spotify()
         if not sp: return "Spotify no está configurado."
         try:
@@ -639,6 +649,7 @@ class PikaAgent(Agent):
         did = device["id"]
         try:
             sp.start_playback(device_id=did)
+            self._last_music_command = ("resume_music", time.time())
             return "Sigo con la música."
         except SpotifyException as exc:
             if getattr(exc, "http_status", None) == 403:
@@ -659,6 +670,7 @@ class PikaAgent(Agent):
         did = device["id"]
         try:
             sp.next_track(device_id=did)
+            self._last_music_command = ("next_track", time.time())
             return "Listo, cambio de canción."
         except SpotifyException as exc:
             if getattr(exc, "http_status", None) == 403:
@@ -679,6 +691,7 @@ class PikaAgent(Agent):
         did = device["id"]
         try:
             sp.previous_track(device_id=did)
+            self._last_music_command = ("previous_track", time.time())
             return "Vuelvo a la anterior."
         except SpotifyException as exc:
             if getattr(exc, "http_status", None) == 403:
@@ -955,9 +968,9 @@ async def entrypoint(ctx: agents.JobContext):
                 type="server_vad",
                 threshold=0.5,
                 prefix_padding_ms=300,
-                silence_duration_ms=500,
+                silence_duration_ms=800,
                 create_response=True,
-                interrupt_response=True,
+                interrupt_response=False,
             )
             # You can configure turn detection via the plugin if you want;
             # OpenAI Realtime has built-in VAD/turn-detection by default.
