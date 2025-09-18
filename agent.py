@@ -357,6 +357,8 @@ class PikaAgent(Agent):
         text: str,
         *,
         allow_fallback: bool = False,
+        context: RunContext | None = None,
+        await_playout: bool = False,
     ) -> None:
         """Speak using the realtime voice, falling back to local TTS if allowed."""
         text = (text or "").strip()
@@ -364,17 +366,81 @@ class PikaAgent(Agent):
             return
         if session is None:
             _log("skip speech (no active session)")
+            if context is not None:
+                await self._say_via_generate_reply(context, text, await_playout=await_playout)
             return
         try:
             handle = session.say(text)
         except Exception as exc:
             _log("session.say failed", exc)
+            if context is not None:
+                await self._say_via_generate_reply(context, text, await_playout=await_playout)
+            elif allow_fallback and USE_LOCAL_TTS_FALLBACK:
+                await _say_local_exact(text)
             return
 
         wait_coro = getattr(handle, "wait_for_playout", None)
         if callable(wait_coro):
-            # fire-and-forget so we don't block this tool while the audio finishes
-            asyncio.create_task(asyncio.shield(wait_coro()))
+            if await_playout:
+                try:
+                    await asyncio.wait_for(wait_coro(), timeout=10.0)
+                except Exception:
+                    pass
+            else:
+                # fire-and-forget so we don't block this tool while the audio finishes
+                asyncio.create_task(asyncio.shield(wait_coro()))
+
+    async def _say_via_generate_reply(
+        self,
+        context: RunContext | None,
+        text: str,
+        *,
+        await_playout: bool = False,
+    ) -> None:
+        text = (text or "").strip()
+        if not text or context is None:
+            return
+        session = getattr(context, "session", None)
+        if session is None:
+            return
+        try:
+            handle = session.generate_reply(
+                instructions=(
+                    "Decí exactamente el siguiente texto y no agregues nada más:\n"
+                    f"{text}"
+                ),
+                tool_choice="none",
+                allow_interruptions=False,
+            )
+        except Exception as exc:
+            _log("generate_reply failed", exc)
+            return
+
+        wait_coro = getattr(handle, "wait_for_playout", None)
+        if callable(wait_coro):
+            if await_playout:
+                try:
+                    await asyncio.wait_for(wait_coro(), timeout=10.0)
+                except Exception:
+                    pass
+            else:
+                asyncio.create_task(asyncio.shield(wait_coro()))
+
+    async def _wait_for_active_playout(
+        self,
+        context: RunContext | None,
+        *,
+        timeout: float = 5.0,
+    ) -> None:
+        if context is None:
+            return
+        waiter = getattr(context, "wait_for_playout", None)
+        if not callable(waiter):
+            return
+        try:
+            await asyncio.wait_for(waiter(), timeout=timeout)
+        except Exception:
+            pass
     # Tiny state toggle the model can call when it hears the wake/stop words.
     @function_tool(description="Activa o desactiva el modo 'despierto' del asistente.")
     async def set_awake(self, context: RunContext, awake: bool) -> str:
@@ -382,9 +448,19 @@ class PikaAgent(Agent):
         self._awake = bool(awake)
         session = getattr(context, "session", None)
         if self._awake and not was:
-            await self._say_via_session(session, "¡Pika! ¿En qué te ayudo?", allow_fallback=True)
+            await self._say_via_session(
+                session,
+                "¡Pika! ¿En qué te ayudo?",
+                allow_fallback=True,
+                context=context,
+            )
         elif (not self._awake) and was:
-            await self._say_via_session(session, "Hasta luego. Pika.", allow_fallback=True)
+            await self._say_via_session(
+                session,
+                "Hasta luego. Pika.",
+                allow_fallback=True,
+                context=context,
+            )
         return f"awake={self._awake}"
 
     @function_tool(
@@ -543,10 +619,16 @@ class PikaAgent(Agent):
     async def take_photo(self, context: RunContext, question: str | None = None) -> dict:
         if not self._awake:
             return {"error": "Estoy dormido por ahora."}
+        await self._wait_for_active_playout(context)
         with contextlib.suppress(Exception):
             context.disallow_interruptions()
         session = getattr(context, "session", None)
-        await self._say_via_session(session, "Mmm... dejame ver un segundito.")
+        await self._say_via_session(
+            session,
+            "Mmm... dejame ver un segundito.",
+            context=context,
+            await_playout=True,
+        )
         async with self._camera_lock:
             tmp = Path("/tmp") / f"pika_{int(datetime.datetime.now().timestamp())}.jpg"
 
@@ -593,7 +675,7 @@ class PikaAgent(Agent):
             result["answer"] = speak
             result["assistant_response"] = speak
 
-        await self._say_via_session(session, speak, allow_fallback=True)
+        await self._say_via_session(session, speak, allow_fallback=True, context=context)
         # respuesta pensada para *hablar*
         return {
             "assistant_response": speak,
@@ -619,6 +701,7 @@ class PikaAgent(Agent):
             return {"error": "Estoy dormido por ahora."}
         if not self._last_data_url:
             return {"error": "No tengo una foto reciente. Decime: 'sacá una foto'."}
+        await self._wait_for_active_playout(context)
         with contextlib.suppress(Exception):
             context.disallow_interruptions()
 
@@ -637,7 +720,7 @@ class PikaAgent(Agent):
         result["answer"] = speak
         result["assistant_response"] = speak
         session = getattr(context, "session", None)
-        await self._say_via_session(session, speak, allow_fallback=True)
+        await self._say_via_session(session, speak, allow_fallback=True, context=context)
         return {
             "assistant_response": speak,
             "answer": speak,
