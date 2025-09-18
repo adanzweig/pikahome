@@ -26,6 +26,7 @@ import re
 import unicodedata
 import json
 from openai import OpenAI
+from openai.types.beta.realtime.session import TurnDetection
 load_dotenv()
 
 Path("/home/bk/pika-voice/pikahome").mkdir(parents=True, exist_ok=True)
@@ -635,10 +636,12 @@ class PikaAgent(Agent):
             if speak:
                 self._forced_transcript = speak
                 self._forced_ready.set()
-            await self._say_via_session(session, speak, allow_fallback=True)
         finally:
             self._cam_gate.clear()
             self._vision_gate.clear()
+
+        if speak:
+            await self._say_via_session(session, speak, allow_fallback=True)
         # respuesta pensada para *hablar*
         return {
             "assistant_response": speak,
@@ -679,9 +682,13 @@ class PikaAgent(Agent):
             speak = "No pude analizar bien la imagen. Probemos con más luz y acercando el objeto."
         result["answer"] = speak
         result["assistant_response"] = speak
+        session = getattr(context, "session", None)
+        if session is not None:
+            await self._interrupt_safely(session)
         if speak:
             self._forced_transcript = speak
             self._forced_ready.set()
+            await self._say_via_session(session, speak, allow_fallback=True)
         return {
             "assistant_response": speak,
             "answer": speak,
@@ -805,6 +812,14 @@ async def entrypoint(ctx: agents.JobContext):
         room=ctx.room,
         agent=PikaAgent(),
         room_input_options=RoomInputOptions(),  # add noise cancellation if you enable that plugin
+        turn_detection=TurnDetection(
+            type="server_vad",
+            threshold=0.5,
+            prefix_padding_ms=300,
+            silence_duration_ms=500,
+            create_response=True,
+            interrupt_response=True,
+        )
     )
 
 if __name__ == "__main__":
