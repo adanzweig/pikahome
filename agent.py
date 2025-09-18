@@ -549,25 +549,50 @@ class PikaAgent(Agent):
             if not kind:
                 return "No encontré eso en Spotify."
 
+            track_uris: list[str] | None = None
+            context_uri: str | None = None
+
+            if kind == "tracklist":
+                track_uris = list(uri_or_uris)
+            elif kind in ("track", "episode"):
+                track_uris = [uri_or_uris]
+            elif kind == "playlist":
+                try:
+                    items = sp.playlist_items(uri_or_uris, additional_types=("track","episode"), limit=50)
+                    track_uris = [
+                        it.get("track", {}).get("uri")
+                        for it in items.get("items", [])
+                        if it.get("track", {}).get("uri")
+                    ]
+                except SpotifyException:
+                    track_uris = None
+                context_uri = uri_or_uris
+            elif kind == "album":
+                try:
+                    tracks = sp.album_tracks(uri_or_uris, limit=50)
+                    track_uris = [t.get("uri") for t in tracks.get("items", []) if t.get("uri")]
+                except SpotifyException:
+                    track_uris = None
+                context_uri = uri_or_uris
+            elif kind == "show":
+                context_uri = uri_or_uris
+
             try:
-                if kind == "tracklist":
-                    sp.start_playback(device_id=did, uris=uri_or_uris)
-                elif kind in ("playlist", "album", "show"):
-                    sp.start_playback(device_id=did, context_uri=uri_or_uris)
-                elif kind in ("track", "episode"):
-                    sp.start_playback(device_id=did, uris=[uri_or_uris])
+                if track_uris:
+                    sp.start_playback(device_id=did, uris=track_uris)
+                elif context_uri:
+                    sp.start_playback(device_id=did, context_uri=context_uri)
                 else:
                     sp.start_playback(device_id=did)
             except SpotifyException:
                 try:
                     sp.transfer_playback(device_id=did)
-                    sp.start_playback(device_id=did)
-                    if kind == "tracklist":
-                        sp.start_playback(device_id=did, uris=uri_or_uris)
-                    elif kind in ("playlist", "album", "show"):
-                        sp.start_playback(device_id=did, context_uri=uri_or_uris)
-                    elif kind in ("track", "episode"):
-                        sp.start_playback(device_id=did, uris=[uri_or_uris])
+                    if track_uris:
+                        sp.start_playback(device_id=did, uris=track_uris)
+                    elif context_uri:
+                        sp.start_playback(device_id=did, context_uri=context_uri)
+                    else:
+                        sp.start_playback(device_id=did)
                 except SpotifyException:
                     pass
         except SpotifyOauthError:
