@@ -17,6 +17,7 @@ from livekit.agents import (
 )
 from livekit.plugins import openai  # Realtime model lives here
 from livekit.agents.llm.tool_context import StopResponse
+from zoneinfo import ZoneInfo
 
 # Spotify
 import spotipy
@@ -63,6 +64,10 @@ SPOTIFY_DEVICE_PROMPT = (
 SPOTIFY_RESTRICTED_MSG = (
     "Spotify está usando otro dispositivo y no me deja controlarlo. Elegí 'pikahome' y volvemos a intentar."
 )
+
+QUIET_ZONE = ZoneInfo("America/Argentina/Buenos_Aires")
+QUIET_START = datetime.time(22, 0)
+QUIET_END = datetime.time(7, 0)
 
 # --- Camera env ---
 PHOTO_W   = int(os.getenv("PHOTO_WIDTH", "640"))
@@ -511,12 +516,28 @@ class PikaAgent(Agent):
 
         self._spotify_device_id = target.get("id")
         return target
+
+    def _is_quiet_hours(self) -> bool:
+        now = datetime.datetime.now(QUIET_ZONE).time()
+        if QUIET_START <= now or now < QUIET_END:
+            return True
+        return False
     # Tiny state toggle the model can call when it hears the wake/stop words.
     @function_tool(description="Activa o desactiva el modo 'despierto' del asistente.")
     async def set_awake(self, context: RunContext, awake: bool) -> str:
         was = self._awake
         new_state = bool(awake)
         session = getattr(context, "session", None)
+        if new_state and self._is_quiet_hours():
+            self._awake = False
+            await self._say_via_session(
+                session,
+                "Pika duerme de noche. Después de las 7 vuelvo a jugar.",
+                allow_fallback=True,
+                context=context,
+                allow_when_asleep=True,
+            )
+            raise StopResponse()
         if not was and new_state:
             await self._say_via_session(
                 session,
@@ -525,7 +546,10 @@ class PikaAgent(Agent):
                 context=context,
                 allow_when_asleep=True,
             )
+            self._awake = True
+            return "awake=True"
         elif was and not new_state:
+            self._awake = False
             await self._say_via_session(
                 session,
                 "Hasta luego. Pika.",
@@ -533,6 +557,7 @@ class PikaAgent(Agent):
                 context=context,
                 allow_when_asleep=True,
             )
+            raise StopResponse()
         self._awake = new_state
         return f"awake={self._awake}"
 
