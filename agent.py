@@ -79,6 +79,21 @@ USE_LOCAL_TTS_FALLBACK = os.getenv("LOCAL_TTS_FALLBACK", "1") == "1"
 OUTPUT_ALSA_DEVICE = os.getenv("OUTPUT_ALSA_DEVICE") or "plughw:3,0"
 TTS_LANG = os.getenv("TTS_LANG", "es-ES")                  # for pico2wave/espeak
 
+WAKE_PHRASES = [
+    "hola pikachu",
+    "hola pika",
+    "hola pika pika",
+    "hola pika-pi",
+]
+SLEEP_PHRASES = [
+    "chau pikachu",
+    "chao pikachu",
+    "chau pika",
+    "chau pika pika",
+    "chau pika-pi",
+]
+RECENT_PHRASE_WINDOW_S = 15.0
+
 async def _say_local_exact(text: str, device: str | None = None):
     """Legacy local speech fallback (espeak-ng). Kept for debugging."""
     if not text:
@@ -315,24 +330,24 @@ class PikaAgent(Agent):
                 "Habla en español (es-AR) con frases cortas y simples. "
                 "No uses emojis. Usa 'pika' o 'pika-pi' ocasionalmente. "
                 "No hables si no estás 'despertado'. Para despertarte, el humano dice 'hola pikachu'. "
-                "Para dormirte, el humano dice 'chau pikachu'. Cuando escuches esas frases, usa la herramienta "
-                "'set_awake' con awake=true o awake=false y responde brevemente. "
-                "Usa la cámara SOLO si te lo piden explícitamen"
-                "(por ejemplo: '¿qué ves?' o '¿qué Pokémon es este"
-                "Para música, usa la herramienta play_music'."
+                "Para dormirte, el humano dice 'chau pikachu'. La plataforma detecta esas frases y llama a "
+                "'set_awake' por vos; no invoques esa herramienta por tu cuenta salvo que el humano te lo pida. "
+                "Cuando la herramienta se ejecute, saludá o despedite brevemente. "
+                "Usa la cámara SOLO si te lo piden explícitamente (por ejemplo: '¿qué ves?' o '¿qué Pokémon es este?'). "
+                "Para música, usa la herramienta play_music. "
                 "Cuando uses la herramienta take_photo: "
                 "- NO inventes. "
                 "- Si el resultado tiene la clave 'assistant_response' o 'answer', RESPONDE EXACTAMENTE ese texto, sin agregar ni cambiar palabras. "
                 "- Si 'confidence' es 'baja', pedí otra foto o más luz. "
                 "- Si querés más detalles, pedilos en una ronda nueva, pero en la primera respuesta usá solo el texto del resultado. "
                 "- Si usas take_photo, ANTES de hablar espera que termine y no inventes hasta tener el resultado. "
-                "Si el niño pregunta otra cosa sobre la MISMA foto, usask_áabout_photo'. "
+                "Si el niño pregunta otra cosa sobre la MISMA foto, usa ask_about_photo. "
                 "Evita temas de adultos; ofrece juegos, cuentos o ciencia sencilla."
                 "Para música: "
                 "- 'poné...', 'quiero escuchar ...' -> usa play_music. "
-                "- 'basta', 'pará', 'pausá-> usa pause_music. "
-                "- 'seguí', 'reanudar-> usa resume_music. "
-                "- 'cambiá de canción','poné otra', 'siguient-> usa next_track. "
+                "- 'basta', 'pará', 'pausá' -> usa pause_music. "
+                "- 'seguí', 'reanudar' -> usa resume_music. "
+                "- 'cambiá de canción', 'poné otra', 'siguiente' -> usa next_track. "
                 "- 'volumen al 50%' -> usa set_volume(50). "
                 "- 'mezclá', 'modo aleatorio'-> usa set_shuffle(true); "
                 "  'sacá el aleatorio' -> usa set_shuffle(false). "
@@ -344,6 +359,9 @@ class PikaAgent(Agent):
         self._camera_lock = asyncio.Lock()
         self._last_photo_path: Path | None = None
         self._last_data_url: str | None = None
+        self._wake_phrase_norms = [_norm(p) for p in WAKE_PHRASES]
+        self._sleep_phrase_norms = [_norm(p) for p in SLEEP_PHRASES]
+        self._last_denied_toggle = 0.0
 
     @staticmethod
     def _extract_answer_text(result: dict) -> str:
@@ -522,6 +540,42 @@ class PikaAgent(Agent):
         if QUIET_START <= now or now < QUIET_END:
             return True
         return False
+
+    def _recent_user_said(
+        self,
+        session: AgentSession | None,
+        phrases: list[str],
+        *,
+        window: float = RECENT_PHRASE_WINDOW_S,
+    ) -> bool:
+        if session is None:
+            return False
+        history = getattr(session, "history", None)
+        if history is None:
+            return False
+        now = time.time()
+        for item in reversed(history.items):
+            if getattr(item, "type", None) != "message":
+                continue
+            if getattr(item, "role", None) != "user":
+                continue
+            created_at = getattr(item, "created_at", 0.0)
+            if window > 0 and now - created_at > window:
+                break
+            text = ""
+            if hasattr(item, "text_content") and item.text_content:
+                text = item.text_content
+            else:
+                content = getattr(item, "content", [])
+                if isinstance(content, list):
+                    text = " ".join(c for c in content if isinstance(c, str))
+            text = _norm(text)
+            if not text:
+                continue
+            for phrase in phrases:
+                if phrase and phrase in text:
+                    return True
+        return False
     # Tiny state toggle the model can call when it hears the wake/stop words.
     @function_tool(description="Activa o desactiva el modo 'despierto' del asistente.")
     async def set_awake(self, context: RunContext, awake: bool) -> str:
@@ -539,6 +593,13 @@ class PikaAgent(Agent):
             )
             raise StopResponse()
         if not was and new_state:
+            if not self._recent_user_said(session, self._wake_phrase_norms):
+                now = time.time()
+                if now - self._last_denied_toggle > 2.0:
+                    _log("ignoro wake: no escuché 'hola pikachu'")
+                self._last_denied_toggle = now
+                self._awake = False
+                raise StopResponse()
             await self._say_via_session(
                 session,
                 "¡Pika! ¿En qué te ayudo?",
@@ -547,9 +608,17 @@ class PikaAgent(Agent):
                 allow_when_asleep=True,
             )
             self._awake = True
+            self._last_denied_toggle = 0.0
             return "awake=True"
         elif was and not new_state:
+            if not self._recent_user_said(session, self._sleep_phrase_norms):
+                now = time.time()
+                if now - self._last_denied_toggle > 2.0:
+                    _log("ignoro sleep: no escuché 'chau pikachu'")
+                self._last_denied_toggle = now
+                return "awake=True"
             self._awake = False
+            self._last_denied_toggle = 0.0
             await self._say_via_session(
                 session,
                 "Hasta luego. Pika.",
